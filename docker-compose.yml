@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/url_shortener.db
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+  
+  redis:
+    image: "redis:7-alpine"
+    ports:
+      - "6385:6379"
+    volumes: 
+      - redis_data:/data
+    restart: unless-stopped
+
+  test-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: test_db
+    ports:
+      - "5435:5432"
+    volumes:
+      - test_db_data:/var/lib/postgresql/data
+    profiles:
+      - testing
+
+
+volumes:
+  redis_data:
+  test_db_data:
