@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package url_shortener;
+
+// URL kısaltma servisi
+service UrlShortenerService {
+    // URL'i kısalt
+    rpc ShortenUrl(ShortenUrlRequest) returns (ShortenUrlResponse);
+    
+    // Kısa kodu çöz
+    rpc ResolveUrl(ResolveUrlRequest) returns (ResolveUrlResponse);
+    
+    // İstatistikleri getir
+    rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+    
+    // Kullanıcının URL'lerini listele
+    rpc ListUrls(ListUrlsRequest) returns (ListUrlsResponse);
+}
+
+// Request/Response mesajları
+message ShortenUrlRequest {
+    string original_url = 1;
+    optional string custom_code = 2;
+    optional int32 expires_in_days = 3;
+}
+
+message ShortenUrlResponse {
+    string short_code = 1;
+    string short_url = 2;
+    string original_url = 3;
+    int64 created_at = 4;
+    optional int64 expires_at = 5;
+}
+
+message ResolveUrlRequest {
+    string short_code = 1;
+}
+
+message ResolveUrlResponse {
+    string original_url = 1;
+    bool found = 2;
+    bool expired = 3;
+}
+
+message GetStatsRequest {
+    string short_code = 1;
+}
+
+message GetStatsResponse {
+    string short_code = 1;
+    string original_url = 2;
+    int64 click_count = 3;
+    int64 created_at = 4;
+    optional int64 expires_at = 5;
+    repeated ClickInfo recent_clicks = 6;
+}
+
+message ClickInfo {
+    int64 timestamp = 1;
+    string ip_address = 2;
+    string user_agent = 3;
+    string referer = 4;
+}
+
+message ListUrlsRequest {
+    int32 limit = 1;
+    int32 offset = 2;
+}
+
+message ListUrlsResponse {
+    repeated UrlInfo urls = 1;
+    int32 total_count = 2;
+}
+
+message UrlInfo {
+    string short_code = 1;
+    string original_url = 2;
+    int64 click_count = 3;
+    int64 created_at = 4;
+    optional int64 expires_at = 5;
+}
