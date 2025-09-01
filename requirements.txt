@@ -1,0 +1,28 @@
+# FastAPI
+fastapi==0.104.2
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings=2.1.0
+
+# gRPC
+grpcio==1.59.0
+grpcio-tools==1.59.0
+protobuf==4.25.0
+
+# Async Database
+sqlalchemy[asyncio]==2.0.23
+aiosqlite==0.19.0
+alembic==1.12.1
+
+# Cache (opsiyonel)
+aioredis==2.0.1
+
+# Utility
+python-multipart==0.0.6
+httpx==0.25.2
+
+# Development
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+isort==5.12.0
