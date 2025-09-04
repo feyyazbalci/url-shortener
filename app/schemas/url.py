@@ -94,5 +94,114 @@ class ListUrlsRequest(BaseSchema):
         description="Sort order (asc or desc)"
     )
 
+# Response Schemas
+class UrlClickResponse(BaseSchema):
+    """URL click statistics."""
 
-    
+    id: int
+    timestamp: datetime = Field(alias="created_at")
+    ip_address: Optional[str]
+    user_agent: Optional[str]
+    referer: Optional[str]
+    country: Optional[str]
+    city: Optional[str]
+
+class ShortenedUrlResponse(BaseSchema, TimestampSchema):
+    """Response schema for a shortened URL"""
+
+    short_code: str = Field(description="The short code for the URL")
+    short_url: str = Field(description="The full shortened URL")
+    original_url: str = Field(description="The original URL")
+
+    title: Optional[str] = Field(None, description="The title of the URL")
+    description: Optional[str] = Field(None, description="The description of the URL")
+
+    click_count: int = Field(description="Total number of clicks")
+    is_active: bool = Field("Whether the URL is active")
+    is_custom: bool = Field("Whether the short code is custom")
+    is_expired: bool = Field("Whether the URL has expired")
+
+    expires_at: Optional[datetime] = Field(None, description="Expiration datetime if set")
+    days_until_expiry: Optional[int] = Field(None, description="Days until expiration if set")
+
+    # Optional analytics
+    recent_clicks: Optional[List[UrlClickResponse]] = Field(
+        None,
+        description="List of recent clicks if requested",
+    )
+
+class ShortenUrlResponse(BaseSchema):
+
+    success: bool = True
+    short_code: str
+    short_url: str
+    original_url: str
+    expires_at: Optional[datetime] = None
+    created_at: datetime
+
+class ResolveUrlResponse(BaseSchema):
+    """Response schema for resolving a short URL"""
+
+    success: bool
+    original_url: Optional[str] = None
+    found: bool
+    expired: bool = False
+    message: Optional[str] = None
+
+class UrlStatsResponse(BaseSchema):
+    """URL statistics response schema"""
+
+    url_info: ShortenedUrlResponse
+    analytics: dict = Field(
+        description="Detailed analytics data",
+        examples=[{
+            "total_clicks": 150,
+            "unique_ips": 75,
+            "top_countries": [{"country": "TR", "count": 32}],
+            "daily_clicks": [{"date": "2025-09-04", "clicks": 10}],
+            "top_referers": [{"referer": "google.com", "count": 20}]
+        }]
+    )
+
+class ListUrlsResponse(PaginationResponse):
+    """URL listing response schema with pagination"""
+
+    urls: List[ShortenedUrlResponse]
+
+    def __init__(self, urls: List, total: int, limit: int, offset: int):
+        super().__init__(
+            items=urls,
+            total=total,
+            limit=limit,
+            offset=offset,
+            urls=urls
+        )
+
+# Utility Schemas
+class BulkShortenRequest(BaseSchema):
+    """Total URLs to shorten in bulk"""
+    urls: List[ShortenUrlRequest] = Field(
+        ...,
+        min_items=1,
+        max_items=50,
+        description="Shortening requests"
+    )
+
+    default_expires_in_days: Optional[int] = Field(
+        None,
+        description="Default expiration in days for URLs without specific expiry"
+    )
+
+class BulkShortenResponse(BaseSchema):
+    success: bool = True
+    results: List[ShortenUrlResponse]
+    failed_count: int = 0
+    success_count: int
+    errors: Optional[List[dict]] = None
+
+class UrlValidationResponse(BaseSchema):    
+    is_valid: bool
+    is_accessible: bool = False
+    status_code: Optional[int] = None
+    title: Optional[str] = None
+    message: Optional[str] = None
