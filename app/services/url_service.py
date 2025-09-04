@@ -91,6 +91,241 @@ class UrlService:
             created_at=shortened_url.created_at
         )
     
+    async def resolve_url(
+        self,
+        db: AsyncSession,
+        short_code: str,
+        track_click: Optional[str] = None,
+        visitor_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        referer: Optional[str] = None
+    ) -> ResolveUrlResponse:
+        """Resolve short code and return original URL"""
+
+        # Control in cache
+        cached_url = await self._get_cached_url(short_code)
+        if cached_url:
+            if track_click:
+                asyncio.create_task(
+                    self._track_click_async(db, short_code, visitor_ip, user_agent, referer)
+                )
+            return ResolveUrlResponse(
+                success=True,
+                original_url=cached_url,
+                found=True,
+                expired=False
+            )
+        
+        # Find in DB
+        result = await db.execute(
+            select(ShortenedUrl).where(ShortenedUrl.short_code == short_code)
+        )
+        url = result.scalar_one_or_none()
+
+        if not url:
+            return ResolveUrlResponse(
+                success=False,
+                found=False,
+                expired=False,
+                message="Short code not found"
+            )
+        
+        if not url.is_accessible:
+            expired = url.is_expired
+            return ResolveUrlResponse(
+                success=False,
+                found=True,
+                expired=expired,
+                message="URL is not accessible" + (" (expired)" if expired else " (deactivated)")
+            )
+        
+        # Click tracking
+        if track_click:
+            url.increment_clicks()
+            await db.commit()
+
+            asyncio.create_task(
+                self._track_click_async(db, short_code, visitor_ip, user_agent, referer)
+            )
+
+        await self._cache_url(short_code, url.original_url)
+
+        return ResolveUrlResponse(
+            success=True,
+            original_url=url.original_url,
+            found=True,
+            expired=False
+        )
+
+    async def get_url_info(
+        self,
+        db: AsyncSession,
+        short_code: str,
+        include_recent_clicks: bool = False
+    ) -> Optional[ShortenedUrlResponse]:
+        
+        query = select(ShortenedUrl).where(ShortenedUrl.short_code == short_code)
+
+        if include_recent_clicks:
+            query = query.options(selectinload(ShortenedUrl.clicks))
+
+        result = await db.execute(query)
+        url = result.scalar_one_or_none()
+
+        if not url:
+            return None
+        
+        recent_clicks = []
+        if include_recent_clicks:
+            recent_clicks_query = (
+                select(UrlClick)
+                .where(UrlClick.short_code == short_code)
+                .order_by(UrlClick.created_at.desc())
+                .limit(10)
+            )
+            clicks_result = await db.execute(recent_clicks_query)
+            recent_clicks = clicks_result.scalars().all()
+
+        return ShortenedUrlResponse(
+            short_code=url.short_code,
+            short_url=f"{self.base_url}/{url.short_code}",
+            original_url=url.original_url,
+            title=url.title,
+            description=url.description,
+            click_count=url.click_count,
+            is_active=url.is_active,
+            is_custom=url.is_custom,
+            is_expired=url.is_expired,
+            expires_at=url.expires_at,
+            days_until_expiry=url.days_until_expiry,
+            created_at=url.created_at,
+            updated_at=url.updated_at,
+            recent_clicks=[
+                {
+                    "id": click.id,
+                    "timestamp": click.created_at,
+                    "ip_address": click.ip_address,
+                    "user_agent": click.user_agent,
+                    "referer": click.referer,
+                    "country": click.country,
+                    "city": click.city
+                }
+                for click in recent_clicks
+            ] if include_recent_clicks else None
+        )
+    
+    async def list_urls(
+        self,
+        db: AsyncSession,
+        request: ListUrlsRequest
+    ) -> Tuple[List[ShortenedUrl], int]:
+        query = select(ShortenedUrl)
+        count_query = select(func.count(ShortenedUrl.short_code))
+
+        # Filters
+        conditions = []
+
+        if request.is_active is not None:
+            conditions.append(ShortenedUrl.is_active == request.is_active)
+
+        if request.is_expired is not None:
+            if request.is_expired:
+                conditions.append(
+                    and_(
+                        ShortenedUrl.expires_at.is_not(None),
+                        ShortenedUrl.expires_at < func.now()
+                    )
+                )
+            else:
+                conditions.append(
+                    or_(
+                        ShortenedUrl.expires_at.is_(None),
+                        ShortenedUrl.expires_at >= func.now()
+                    )
+                )
+
+        if conditions:
+            query = query.where(and_(*conditions))
+            count_query =  count_query.where(and_(*conditions))
+
+        # Sorting
+        if request.sort_by == "created_at":
+            order_col = ShortenedUrl.created_at
+        elif request.sort_by == "click_count":
+            order_col = ShortenedUrl.click_count
+        elif request.sort_by == "expires_at":
+            order_col = ShortenedUrl.expires_at
+        else:
+            order_col = ShortenedUrl.created_at
+
+        if request.sort_order == "asc":
+            query = query.order_by(order_col.asc())
+        else:
+            query = query.order_by(order_col.desc())
+
+        # Pagination
+        query = query.offset(request.offset).limit(request.limit)
+        
+        # Execute queries
+        urls_result = await db.execute(query)
+        count_result = await db.execute(count_query)
+        
+        urls = urls_result.scalars().all()
+        total = count_result.scalar()
+        
+        return urls, total
+    
+    async def update_url(
+        self,
+        db: AsyncSession,
+        short_code: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        expires_in_days: Optional[int] = None,
+        is_active: Optional[bool] = None
+    ) -> Optional[ShortenedUrlResponse]:
+        
+        result = await db.execute(
+            select(ShortenedUrl).where(ShortenedUrl.short_code == short_code)
+        )
+        url = result.scalar_one_or_none()
+
+        if not url:
+            return None
+        if title is not None:
+            url.title = title
+        if description is not None:
+            url.description = description
+        if expires_in_days is not None:
+            url.expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
+        if is_active is not None:
+            url.is_active = is_active
+
+            if not is_active:
+                await self._remove_from_cache(short_code)
+
+        await db.commit()
+        await db.refresh(url)
+
+        return await self.get_url_info(db, short_code)
+        
+    
+    async def delete_url(self, db: AsyncSession, short_code: str) -> bool:
+        result = await db.execute(
+            select(ShortenedUrl).where(ShortenedUrl.short_code == short_code)
+        )
+
+        url = result.scalar_one_or_none()
+
+        if not url:
+            return False
+        
+        await self._remove_from_cache(short_code)
+        
+        await db.delete(url)
+        await db.commit()
+        return True
+    
     async def _generate_unique_code(self, db: AsyncSession, max_attempts: int = 10) -> str:        
         for _ in range(max_attempts):
             code = ''.join(
@@ -139,3 +374,43 @@ class UrlService:
                 )
             except Exception:
                 pass
+
+    async def _get_cached_url(self, short_code: str) -> Optional[str]:
+        redis = await get_redis()
+        if redis:
+            try:
+                return await redis.get(f"url:{short_code}")
+            except Exception:
+                return None
+        return None
+    
+    async def _remove_from_cache(self, short_code:str) -> None:
+        redis = await get_redis()
+        if redis:
+            try:
+                return await redis.delete(f"url:{short_code}")
+            except Exception:
+                return None
+        return None
+    
+    async def _track_click_async(
+        self,
+        db: AsyncSession,
+        short_code: str,
+        visitor_ip: Optional[str],
+        user_agent: Optional[str],
+        referer: Optional[str]
+    ) -> None:
+        """Async click tracking"""
+        try:
+            click = UrlClick(
+                short_code=short_code,
+                ip_address=visitor_ip,
+                user_agent=user_agent,
+                referer=referer
+            )
+            db.add(click)
+            await db.commit()
+            await db.refresh(click)
+        except Exception:
+            pass
