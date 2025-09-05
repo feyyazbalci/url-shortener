@@ -15,7 +15,7 @@ class AnalyticsService:
 
     def __init__(self):
         self.cache_prefix = "analytics:"
-        self.cache_ttl = 1800 # 30 dakika
+        self.cache_ttl = 1800 # 30 minutes
 
     async def get_url_stats(
         self,
@@ -269,6 +269,179 @@ class AnalyticsService:
 
         return geo_stats
     
+    async def get_referrer_stats(
+        self,
+        db: AsyncSession,
+        short_code: Optional[str] = None,
+        limit: int = 20
+    ) -> List[Dict[str, any]]:
+        cache_key = f"{self.cache_prefix}referrer_stats:{short_code or 'global'}:{limit}"
+        cached_stats = await self._get_cached_stats(cache_key)
+
+        if cached_stats:
+            return cached_stats
+        
+        base_query = select(UrlClick.referer, func.count().label('count'))
+
+        if short_code:
+            base_query = base_query.where(UrlClick.short_code == short_code)
+
+        referrer_query = (
+            base_query
+            .where(UrlClick.referer.is_not(None))
+            .group_by(UrlClick.referer)
+            .order_by(desc('count'))
+            .limit(limit)
+        )
+
+        result = await db.execute(referrer_query)
+
+        referrer_stats = []
+        for row in result:
+            referer = row.referer
+            domain = self._extract_domain(referer)
+
+            referrer_stats.append({
+                "referer": referer,
+                "domain": domain,
+                "count": row.count
+            })
+
+        # Cache the value
+
+        await self._cache_stats(cache_key, referrer_stats)
+
+        return referrer_stats
+    
+    async def get_user_agent_stats(
+        self,
+        db: AsyncSession,
+        short_code: Optional[str] = None   
+    ) -> Dict[str, Any]:
+        """User agent analysis"""
+
+        cache_key = f"{self.cache_prefix}ua_stats:{short_code or 'global'}"
+        cached_stats = await self._get_cached_stats(cache_key)
+        
+        if cached_stats:
+            return cached_stats
+        
+        base_query = select(UrlClick.user_agent)
+        
+        if short_code:
+            base_query = base_query.where(UrlClick.short_code == short_code)
+
+        result = await db.execute(base_query.where(UrlClick.user_agent.is_not(None)))
+        user_agents = [row.user_agent for row in result]
+
+        # Parsing user agent
+        browser_stats = defaultdict(int)
+        os_stats = defaultdict(int)
+        device_stats = defaultdict(int)
+
+        for ua in user_agents:
+            browser, os, device = self._parse_user_agent(ua)
+            browser_stats[browser] += 1
+            os_stats[os] += 1
+            device_stats[device] += 1
+        
+        ua_stats = {
+            "browsers": dict(browser_stats.most_common(10)),
+            "operating_systems": dict(os_stats.most_common(10)),
+            "devices": dict(device_stats.most_common(10)),
+            "total_agents": len(user_agents),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+
+        # Cache the value
+        await self._cache_stats(cache_key, ua_stats)
+        
+        return ua_stats
+    
+    async def _get_comprehensive_analytics(
+        self,
+        db: AsyncSession,
+        short_code: str,
+        include_detailed_clicks: bool = False,
+        click_limit: int = 100
+    ) -> Dict[str, Any]:
+        """Comprehensive analytics data for a URL."""
+        
+        # Click statistics
+        click_stats_query = text("""
+            SELECT 
+                COUNT(*) as total_clicks,
+                COUNT(DISTINCT ip_address) as unique_visitors,
+                COUNT(DISTINCT DATE(created_at)) as active_days,
+                MIN(created_at) as first_click,
+                MAX(created_at) as last_click
+            FROM url_clicks 
+            WHERE short_code = :short_code
+        """)
+
+        result = await db.execute(click_stats_query, {"short_code": short_code})
+        stats_row = result.fetchone()
+
+        analytics = {
+            "click_statistics": {
+                "total_clicks": stats_row.total_clicks if stats_row else 0,
+                "unique_visitors": stats_row.unique_visitors if stats_row else 0,
+                "active_days": stats_row.active_days if stats_row else 0,
+                "first_click": stats_row.first_click.isoformat() if stats_row and stats_row.first_click else None,
+                "last_click": stats_row.last_click.isoformat() if stats_row and stats_row.last_click else None
+            }
+        }
+
+        # Last 7 days
+        daily_stats = await self.get_daily_stats(db, short_code, days=7)
+        analytics["recent_daily_stats"] = daily_stats
+
+        geo_stats = await self.get_geographic_stats(db, short_code, limit=10)
+        analytics["geographic_distribution"] = geo_stats
+
+        # Top referrers
+        referrer_stats = await self.get_referrer_stats(db, short_code, limit=10)
+        analytics["top_referrers"] = referrer_stats
+        
+        # User agent analysis
+        ua_stats = await self.get_user_agent_stats(db, short_code)
+        analytics["user_agent_analysis"] = ua_stats
+
+        if include_detailed_clicks:
+            detailed_clicks_query = (
+                select(UrlClick)
+                .where(UrlClick.short_code == short_code)
+                .order_by(desc(UrlClick.created_at))
+                .limit(click_limit)
+            )
+
+            clicks_result = await db.execute(detailed_clicks_query)
+            clicks = clicks_result.scalars().all()
+
+            analytics["recent_clicks"] = [
+                {
+                    "id": click.id,
+                    "timestamp": click.created_at.isoformat(),
+                    "ip_address": self._mask_ip(click.ip_address),
+                    "user_agent": click.user_agent,
+                    "referer": click.referer,
+                    "country": click.country,
+                    "city": click.city
+                }
+                for click in clicks
+            ]
+
+        if stats_row and stats_row.total_clicks > 0:
+            days_since_creation = (datetime.utcnow() - stats_row.first_click).days + 1
+            analytics["performance_metrics"] = {
+                "clicks_per_day": round(stats_row.total_clicks / max(days_since_creation, 1), 2),
+                "unique_visitor_ratio": round(stats_row.unique_visitors / stats_row.total_clicks * 100, 1),
+                "days_since_creation": days_since_creation,
+                "days_since_last_click": (datetime.utcnow() - stats_row.last_click).days if stats_row.last_click else None
+            }
+        
+        return analytics
+
     async def _get_cached_stats(self, cache_key: str) -> Optional[Dict[str, Any]]:
         redis = await get_redis()
         if redis:
