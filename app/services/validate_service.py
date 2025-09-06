@@ -1,6 +1,7 @@
 import asyncio
 import httpx
 import re
+import hashlib
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urljoin
 from datetime import datetime, timedelta
@@ -96,6 +97,134 @@ class ValidationService:
             
         except Exception as e:
             validation_result["errors"].append(f"Validation error: {str(e)}")
+
+        return validation_result
+
+    async def batch_validate_urls(
+        self,
+        urls: List[str],
+        max_concurrent: int = 10
+    ) -> Dict[str, Dict[str, any]]:
+        """Batch URL validation"""
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def validate_single(url: str) -> Tuple[str, Dict[str, any]]:
+            async with semaphore:
+                result = await self.validate_url(url, check_accessibility=True)
+                return url, result
+            
+        # Execute all validations concurrently
+        tasks = [validate_single(url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        validation_results = {}
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+
+            url, validation = result
+            validation_results[url] = validation
+
+        return validation_results
+    
+    async def get_url_metadata(self, url: str) -> Dict[str, any]:
+        """Extract URL metadata (title, description, etc.)."""
+
+        cache_key = f"metadata:{self._hash_url(url)}"
+        cached_result = await cache_service.get(cache_key)
+        if cached_result:
+            return cached_result
+        
+        metadata = {
+            "title": None,
+            "description": None,
+            "keywords": None,
+            "og_title": None,
+            "og_description": None,
+            "og_image": None,
+            "canonical_url": None,
+            "language": None,
+            "favicon": None
+        }
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                follow_redirects=True,
+                max_redirects=self.max_redirects,
+                headers={"User-Agent": self.user_agent}
+            ) as client:
+                
+                response = await client.get(url)
+
+                if response.status_code != 200:
+                    return metadata
+                
+                # Only process HTML content
+                content_type = response.headers.get("content-type", "").lower()
+                if "text/html" not in content_type:
+                    return metadata
+                
+                # Parse HTML
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Extract metadata
+                metadata.update(self._extract_html_metadata(soup, url))
+                
+                # Cache result
+                await cache_service.set(cache_key, metadata, ttl=86400)  # 24 hours
+            
+        except Exception as e:
+            metadata["error"] = str(e)
+        
+        return metadata
+    
+    async def check_url_changes(self, url: str) -> Dict[str, any]:
+        """Check if the URL has changed."""
+        cache_key = f"content_hash:{self._hash_url(url)}"
+        previous_hash = await cache_service.get(cache_key)
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                headers={"User-Agent": self.user_agent}
+            ) as client:
+                
+                # HEAD request for content info
+
+                response = await client.head(url)
+
+                current_info = {
+                    "status_code": response.status_code,
+                    "content_length": response.headers.get("content-length"),
+                    "last_modified": response.headers.get("last-modified"),
+                    "etag": response.headers.get("etag")
+                }
+
+                # Create simple hash from headers
+                current_hash = hash(str(current_info))
+
+                # Compare with previous
+                has_changed = previous_hash != current_hash
+                
+                # Update cache
+                await cache_service.set(cache_key, current_hash, ttl=3600)  # 1 hour
+                
+                return {
+                    "has_changed": has_changed,
+                    "current_info": current_info,
+                    "checked_at": datetime.utcnow().isoformat()
+                }
+
+        except Exception as e:
+            return {
+                "has_changed": None,
+                "error": str(e),
+                "checked_at": datetime.utcnow().isoformat()
+            }
+
 
     def _is_valid_url_format(self, url: str) -> bool:
         """Basic URL validation"""
@@ -319,3 +448,101 @@ class ValidationService:
             pass
         
         return analysis
+    
+    def _hash_url(self, url: str) -> str:
+        """Hash the URL (for cache key)."""
+        return hashlib.md5(url.encode()).hexdigest()
+    
+    async def clean_expired_cache(self) -> int:
+        """Clear expired cache records."""
+
+        try:
+            metadata_keys = await cache_service.keys("metadata:*")
+            content_keys = await cache_service.keys("content_hash:*")
+
+            expired_keys = []
+
+            # Check TTL for each key
+            for key in metadata_keys + content_keys:
+                ttl = await cache_service.ttl(key)
+                if ttl == -1 or ttl == -2: # -2 means key doesn't exist, -1 means no expiry
+                    expired_keys.append(key)
+
+            # Delete expired keys
+            if expired_keys:
+                deleted = await cache_service.mdelete(expired_keys)
+                return deleted
+            
+            return 0
+        except Exception:
+            return 0
+        
+    async def get_validation_stats(self) -> Dict[str, any]:
+        """Validation service statistics."""
+        try:
+            cache_stats = await cache_service.get_stats()
+
+            # validation specific keys
+            metadata_keys = await cache_service.keys("metadata:*")
+            content_keys = await cache_service.keys("content_hash:*")
+
+            return {
+                "cache_status": cache_stats.get("status", "unknown"),
+                "cached_metadata": len(metadata_keys),
+                "cached_content_hashes": len(content_keys),
+                "total_cached_validations": len(metadata_keys) + len(content_keys),
+                "blacklisted_domains": len(self.blacklisted_domains),
+                "suspicious_patterns": len(self.suspicious_patterns),
+                "configuration": {
+                    "timeout": self.timeout,
+                    "max_redirects": self.max_redirects,
+                    "max_content_size": self.max_content_size,
+                    "user_agent": self.user_agent
+                }
+            }
+        except Exception as e:
+            return {"error": str(e)}
+        
+    def add_blacklisted_domain(self, domain: str) -> bool:
+        """Add domain to blacklist."""
+        try:
+            domain = domain.lower().strip()
+            self.blacklisted_domains.add(domain)
+            return True
+        except Exception:
+            return False
+        
+    def remove_blacklisted_domain(self, domain: str) -> bool:
+        """Remove domain from blacklist"""
+        try:
+            domain = domain.lower().strip()
+            if domain in self.blacklisted_domains:
+                self.blacklisted_domains.remove(domain)
+                return True
+            return False
+        except Exception:
+            return False
+        
+    def get_blacklisted_domains(self) -> List[str]:
+        return list(self.blacklisted_domains)
+    
+    async def bulk_check_domains(self, domains: List[str]) -> Dict[str, Dict[str, any]]:
+        """Bulk domain control."""
+        results = {}
+
+        for domain in domains:
+            try:
+                test_url = f"https://{domain}"
+                validation_result = await self.validate_url(
+                    test_url,
+                    check_accessibility=True,
+                    check_content=False,
+                    check_safety=True
+                )
+                results[domain] = validation_result
+            except Exception as e:
+                pass
+
+        return results
+    
+validation_service = ValidationService()
