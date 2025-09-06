@@ -30,7 +30,7 @@ def get_validation_service():
     return validation_service
 
 # Request info dependencies
-async def get_clien_ip(request: Request) -> str:
+async def get_client_ip(request: Request) -> str:
     """Get client IP address."""
 
     # Check X-Forwarded-For header (for proxy/load balancer)
@@ -67,7 +67,7 @@ class RateLimiter:
     async def __call__(
         self,
         request: Request,
-        client_ip: str = Depends(get_clien_ip)
+        client_ip: str = Depends(get_client_ip)
     ):
         if not settings.rate_limit_per_minute:
             return # Rate limiting disabled
