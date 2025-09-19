@@ -4,8 +4,8 @@ services:
   app:
     build: .
     ports:
-      - "8080:8080"
-      - "50051:50051"
+      - "8080:8080" # FastAPI
+      - "50051:50051" # gRPC
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/url_shortener.db
       - REDIS_URL=redis://redis:6379
@@ -14,7 +14,15 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
-  
+    command: >
+      sh -c "
+        echo 'Waiting for services to be ready...' &&
+        sleep 5 &&
+        echo 'Running database migrations...' &&
+        python migrate.py migrate &&
+        echo 'Starting application...' &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000
+      "
   redis:
     image: "redis:7-alpine"
     ports:
